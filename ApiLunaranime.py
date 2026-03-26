@@ -90,8 +90,10 @@ def save_to_json(data: Dict[str, Any], filename: str = "manga_search.json"):
 def search_profile(username):
     params = {'username': username}
     resp = fetch('/animes/profile', params=params)
+    return resp
     if  data := resp.get('data'):
         user_id = data.get('user_id')
+        return data
 
     return resp.get('message')
 
@@ -112,3 +114,14 @@ def get_chapters(slug: str):
 
     resp['data'] = results
     return resp
+
+def get_user_projects(user_id: str):
+    resp = fetch(f'/user/{user_id}/projects')
+    if projects:= resp.get('projects'):
+        return projects
+
+    return resp
+
+def function(slug: str):
+    resp = fetch(f'/manga/title/{slug}')
+    return resp.get('manga')
