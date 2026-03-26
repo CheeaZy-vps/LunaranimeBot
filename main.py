@@ -8,101 +8,117 @@ import re
 import sys
 import html
 import json
+import math
 import time
 import logging
-import requests
+import atexit
 from pathlib import Path
-from typing import Optional, Union, Dict, Any, List
+from typing import Optional, Union, Dict, Any, List, Tuple
 from urllib.parse import quote
-from requests.exceptions import HTTPError, ConnectionError, ReadTimeout
+from dataclasses import dataclass, asdict
+from contextlib import asynccontextmanager
+
+import requests
+from requests.exceptions import HTTPError, ConnectionError, ReadTimeout, RequestException
 try: from json.decoder import JSONDecodeError
 except ImportError: JSONDecodeError = ValueError
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram import KeyboardButton, ReplyKeyboardMarkup, InputMediaPhoto
+from telegram import KeyboardButton, ReplyKeyboardMarkup
 from telegram.ext import (
-    CallbackQueryHandler,
-    ApplicationBuilder,
-    CommandHandler,
-    MessageHandler,
-    ContextTypes,
-    filters,
-    JobQueue
+    ApplicationBuilder, CommandHandler, CallbackQueryHandler,
+    MessageHandler, ContextTypes, filters, JobQueue
 )
-from telegram.error import TelegramError
+from telegram.error import TelegramError, BadRequest
+from telegram.constants import ParseMode
 
-import ApiLunaranime
+# Third-party modules (ensure installed)
+try: import ApiLunaranime
+except ImportError as e:
+    raise ImportError("ApiLunaranime module not found. Please install it.") from e
 
-# Bot Token (use environment variable for security)
-BOT_TOKEN = os.getenv("BOT_TOKEN")
-DB_FILE = Path('.LunaranimeBot.db.json')
-ADMIN_USER_ID = [1308147558]
-DELETE_DELAY = 30  # detik
-BOT_DATABASE = {}
-if DB_FILE.exists():
-    BOT_DATABASE = json.loads(DB_FILE.read_bytes().decode('utf-8'))
+# Configuration
+@dataclass
+class Config:
+    """Bot configuration"""
+    bot_token: str = os.getenv("BOT_TOKEN")
+    db_file: Path = Path('.LunaranimeBot.db.json')
+    admin_user_ids: List[int] = None
+    delete_delay: int = 30
+    max_search_results: int = 30
+    chunk_size: int = 3
+    page_size: int = 30
 
+    def __post_init__(self):
+        if self.admin_user_ids is None: self.admin_user_ids = [1308147558]
+        if not self.bot_token: raise ValueError("BOT_TOKEN environment variable is required")
+
+config = Config()
+
+# Messages
 MESSAGES = {
-    # Welcome & Main Menu
-    "welcome": """👋 <b>Welcome {user_mention}! {lang}</b>\n🆔 <code>{user_id}</code>\n\n🔥 <b>Lunaranime Bot</b>\nSearch and discover your favorite manga instantly!\n\n👇 Tap <b>'🔍 Search Manga'</b> and enter a title to begin.""",
+    "welcome": """👋 <b>Welcome {user_mention}!</b>\n🆔 <code>{user_id}</code>\n\n🔥 <b>Lunaranime Bot</b>\nSearch and discover your favorite manga instantly!\n\n👇 Tap <b>'🔍 Search Manga'</b> to begin your adventure.""",
 
-    "main_menu": """🏠 <b>Main Menu</b>\n\nPlease select an option:""",
+    "main_menu": """🏠 <b>Main Menu</b>\n\nPlease select an option below:""",
 
-    # Search Mode
-    "search_mode": """🔍 <b>Search Mode Activated</b>\n\n📝 <b>Enter manga title below</b>\n\n✨ <b>Examples:</b>\n<code>one piece</code>\n<code>jujutsu kaisen</code>\n<code>demon slayer</code>\n\n⏳ Bot will automatically search results.""",
-    "broadcast_mode": """<b>Broadcast Mode Activated</b>\n\n📝 <b>Enter message below</b>\n""",
+    "search_mode": """🔍 <b>Search Mode Activated</b>\n\n📝 <b>Enter manga title to search</b>\n\n✨ <b>Popular examples:</b>\n<code>one piece</code>\n<code>jujutsu kaisen</code>\n<code>demon slayer</code>\n\n⏳ Bot will automatically display results.""",
 
-    "searching": """🔍 <b>Searching</b> <code>{query}</code>...\n⏳ Please wait a moment.""",
+    "broadcast_mode": """📢 <b>Broadcast Mode Activated</b>\n\n📝 <b>Enter your broadcast message below</b>\n\n💡 This will be sent to all users.""",
 
-    "search_success": """✅ <b>Search Results</b> for <code>{search_query}</code>""",
+    "search_user_projects_mode": """🔍 <b>Search User Projects</b>\n\n📝 <b>Enter username to search projects</b>\n\n ⏳ Bot will find all projects by that user.""",
 
-    "search_total": """📊 <b>Found {total} manga</b> | Page {page} of {total_pages}""",
+    "searching": """🔍 <b>Searching for</b> <code>{query}</code>...\n⏳ Please wait a moment.""",
 
-    "no_results": """❌ <b>No results found</b> for <code>{search_query}</code>""",
+    "search_success": """✅ <b>Search Results</b>\n<i>Found manga for <code>{search_query}</code></i>""",
 
-    "search_suggestions": """💡 <b>Suggestions:</b>\n• One Piece\n• Naruto\n• Demon Slayer\n• Attack on Titan""",
+    "search_total": """📊 <b>{total} manga found</b> | Page {page}/{total_pages}""",
 
-    # Library
-    "my_library": """📚 <b>Your Library</b>\n\n📖 Saved manga collection:""",
-    "library_empty": """📚 <b>Your Library</b>\n\n📭 No manga saved yet.\n\n💡 Search and add manga to your library!""",
+    "no_results": """❌ <b>No results found</b>\n<i>for <code>{search_query}</code></i>\n\n💡 Try different keywords or check spelling.""",
 
-    # Manga Detail
+    "search_suggestions": """💡 <b>Try searching for:</b>\n• One Piece\n• Naruto\n• Demon Slayer\n• Attack on Titan""",
+
+    "my_library": """📚 <b>Your Library</b>\n\n📖 <b>Saved manga collection:</b>""",
+
+    "library_empty": """📚 <b>Your Library</b>\n\n📭 <i>Your library is empty</i>\n\n💡 <b>Search for manga and add them to your library!</b>""",
+
     "manga_detail_title": """📖 <b>{title}</b>""",
     "manga_author": """✍️ <b>Author:</b> {author}""",
     "manga_artist": """🎨 <b>Artist:</b> {artist}""",
     "manga_genre": """🎭 <b>Genres:</b> {genres}""",
     "manga_status": """📊 <b>Status:</b> {status}""",
-    "manga_languages": """🗣️ <b>Languages:</b> {langs}""",
-    "manga_description": """📄 <b>Description:</b>\n{description}""",
+    "manga_languages": """🗣️ <b>Available:</b> {langs}""",
+    "manga_description": """📄 <b>Description:</b>\n\n{description}""",
 
-    # Errors & Status
-    "manga_not_found": """❌ <b>Manga not found</b>""",
+    "manga_not_found": """❌ <b>Manga not found</b>\n\n💡 Return to menu and try searching again.""",
 
-    "unknown_menu": """❓ <b>Invalid option selected</b>""",
+    "unknown_menu": """❓ <b>Invalid option</b>\n\nPlease select from the available menu options.""",
 
-    "error_occurred": """❌ <b>An error occurred</b>\nPlease try again shortly.""",
+    "error_occurred": """⚠️ <b>Something went wrong</b>\n\nPlease try again in a few moments.""",
 
-    "api_error": """⚠️ <b>Service temporarily unavailable</b>\nPlease try again in a few moments.""",
+    "api_error": """🌐 <b>Service temporarily unavailable</b>\n\nPlease try again in a few minutes.""",
 
-    "search_error": """💥 <b>Search failed</b>\n{error}""",
+    "search_error": """💥 <b>Search failed</b>\n\n<i>{error}</i>\n\nPlease try again.""",
 
-    "privacy_not_available": """📄 <b>Privacy Policy</b>\n\nPrivacy policy documentation is currently unavailable.""",
+    "privacy_not_available": """📄 <b>Privacy Policy</b>\n\nPrivacy policy documentation is currently unavailable.\n\nWe respect your privacy and do not store personal data unnecessarily.""",
 
-    # Buttons & Actions
-    "added_to_library": """✅ Added to your library""",
-    "removed_from_library": """✅ Removed from library""",
-    "already_in_library": """✅ Already in your library"""
+    "broadcast_success": """✅ <b>Broadcast completed!</b>\n\n📤 Message sent to <b>{count}</b> users successfully.""",
+
+    "added_to_library": """✅ <b>Added to your library!</b>""",
+    "removed_from_library": """✅ <b>Removed from library</b>""",
+    "already_in_library": """✅ <b>Already in your library</b>"""
 }
 
-# Setup logging
+# Logging setup
 logging.basicConfig(
     level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - %(message)s',
-    datefmt='%Y-%m-%d %H:%M:%S',
-    force=True
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.FileHandler('lunaranime_bot.log', encoding='utf-8'),
+        logging.StreamHandler()
+    ]
 )
-logging.getLogger("httpx").setLevel(logging.WARNING)
 logger = logging.getLogger(__name__)
+logging.getLogger("httpx").setLevel(logging.WARNING)
 
 # Determine if running on Windows
 isWin = os.name == 'nt'
@@ -152,477 +168,483 @@ class UIColor:
 # Aliases for backward compatibility
 printn = UIColor.print_colored
 
+class Database:
+    """Thread-safe database manager"""
+    def __init__(self, db_file: Path):
+        self.db_file = db_file
+        self._data: Dict[str, Any] = {}
+        self._load()
+
+    def _load(self) -> None:
+        """Load database from file"""
+        try:
+            if self.db_file.exists():
+                self._data = json.loads(self.db_file.read_text(encoding='utf-8'))
+        except (json.JSONDecodeError, UnicodeDecodeError) as e:
+            logger.warning(f"Failed to load database: {e}")
+            self._data = {}
+
+    def _save(self) -> None:
+        """Save database to file"""
+        try:
+            self.db_file.parent.mkdir(exist_ok=True)
+            self.db_file.write_text(
+                json.dumps(self._data, ensure_ascii=False, separators=(',', ':')),
+                encoding='utf-8'
+            )
+        except Exception as e: logger.error(f"Failed to save database: {e}")
+
+    def get(self, key: str, default: Any = None) -> Any:
+        return self._data.get(key, default)
+
+    def set(self, key: str, value: Any) -> None:
+        self._data[key] = value
+        self._save()
+
+    def user_exists(self, user_id: str) -> bool:
+        return user_id in self._data
+
+    def ensure_user(self, user_id: str, user_info: Dict[str, Any]) -> None:
+        """Ensure user exists in database"""
+        if not self.user_exists(user_id):
+            self._data[user_id] = {
+                'User': user_info,
+                'Library': {}
+            }
+            self._save()
+
+    def get_library(self, user_id: str) -> Dict[str, Any]:
+        return self._data.get(user_id, {}).get('Library', {})
+
+db = Database(config.db_file)
+
 def format_languages(translated_languages: str) -> str:
     """Format translated_languages JSON string"""
     try:
-        langs = json.loads(translated_languages or f"[]")
-        if langs:
-            lang_flags = {
-                'id': '🇮🇩', 'en': '🇺🇸', 'ko': '🇰🇷',
-                'jp': '🇯🇵', 'th': '🇹🇭', 'vi': '🇻🇳'
-            }
-            return ' '.join(lang_flags.get(lang, '🌐') for lang in langs[:3])
-        return '🌐'
-    except: return '🌐'
+        langs = json.loads(translated_languages or "[]")
+        if not langs: return "🌐"
+
+        lang_flags = {
+            'id': '🇮🇩', 'en': '🇺🇸', 'ko': '🇰🇷',
+            'jp': '🇯🇵', 'th': '🇹🇭', 'vi': '🇻🇳'
+        }
+        return ' '.join(lang_flags.get(lang, '🌐') for lang in langs[:3])
+    except (json.JSONDecodeError, ValueError): return '🌐'
 
 def get_read_url(slug: str) -> str:
     """Generate read URL from slug"""
-    if slug: return f"https://lunaranime.ru/manga/{quote(slug)}"
-    return "https://lunaranime.ru/manga"
+    return f"https://lunaranime.ru/manga/{quote(slug)}" if slug else "https://lunaranime.ru/manga"
 
-class UserState:
-    """Centralized user state management"""
-
-    def __init__(self, context):
-        self.context = context
-
-    def get_search_results(self) -> dict:
-        return self.context.user_data.get('search_results', {})
-
-    def set_search_result(self, search_query: str, results: dict) -> None:
-        self.context.user_data.update({
-            'search_query': search_query,
-            'search_results': results
-        })
-
-    @staticmethod
-    def set_search_mode(update: Update, context: ContextTypes.DEFAULT_TYPE):
-        query = update.callback_query
-        context.user_data.update({
-            'state': 'search',
-            'search_query': '',
-            'search_results': {},
-            'search_page': 1,
-            'search_mode': True,
-            "message_id": query.message.message_id,
-            "chat_id": query.message.chat_id,
-            "user_id": query.from_user.id
-        })
-
-    @staticmethod
-    def get_state(context: ContextTypes.DEFAULT_TYPE) -> str:
-        return context.user_data.get('state', 'idle')
-
-    @staticmethod
-    def clear_search(context: ContextTypes.DEFAULT_TYPE):
-        context.user_data.update({
-            'state': 'idle',
-            'search_query': '',
-            'search_results': {},
-            'search_mode': False
-        })
+def get_status_emoji(status: str) -> str:
+    """Get emoji for manga status"""
+    return {
+        'completed': "✅",
+        'ongoing': "🔄",
+        'hiatus': "⏸️"
+    }.get(status.lower(), "❓")
 
 class MessageManager:
-    @staticmethod
-    async def send_temp(context: ContextTypes.DEFAULT_TYPE, chat_id: int, text: str,
-                       reply_markup=None, parse_mode='HTML', delay=DELETE_DELAY):
-        """Send temporary message"""
-        message = await context.bot.send_message(
-            chat_id=chat_id,
-            text=text,
-            reply_markup=reply_markup,
-            parse_mode=parse_mode,
-            protect_content=True,
-            disable_web_page_preview=True
-        )
-
-        # Schedule deletion
-        context.job_queue.run_once(
-            MessageManager._delete_message,
-            when=delay,
-            data={'chat_id': chat_id, 'message_id': message.message_id},
-            name=f"del_{message.message_id}"
-        )
-        return message
+    """Message management utilities"""
 
     @staticmethod
-    async def _delete_message(context: ContextTypes.DEFAULT_TYPE):
-        """Internal delete callback"""
-        job = context.job
-        data = job.data
+    async def send_temp(context: ContextTypes.DEFAULT_TYPE,
+                       chat_id: int,
+                       text: str,
+                       reply_markup: Optional[InlineKeyboardMarkup] = None,
+                       delay: int = None) -> Optional[int]:
+        """Send temporary message with auto-delete"""
+        if delay is None: delay = config.delete_delay
 
-        try: await context.bot.delete_message(**data)
-        except Exception as e: logger.debug(f"Delete failed (normal): {e}")
+        try:
+            message = await context.bot.send_message(
+                chat_id=chat_id,
+                text=text,
+                reply_markup=reply_markup,
+                parse_mode=ParseMode.HTML,
+                protect_content=True,
+                disable_web_page_preview=True
+            )
 
+            # Schedule deletion
+            context.job_queue.run_once(
+                MessageManager._delete_message,
+                when=delay,
+                data={'chat_id': chat_id, 'message_id': message.message_id},
+                name=f"del_{message.message_id}"
+            )
+            return message.message_id
+        except Exception as e:
+            logger.error(f"Failed to send temp message: {e}")
+            return None
 
-async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Handle button presses."""
-    query = update.callback_query
-    await query.answer()
+    @staticmethod
+    async def _delete_message(context: ContextTypes.DEFAULT_TYPE) -> None:
+        """Delete message callback"""
+        try:
+            data = context.job.data
+            await context.bot.delete_message(**data)
+        except Exception as e: logger.debug(f"Delete failed: {e}")
 
-    user_id = query.from_user.id
-    data = query.data
+class MangaHandler:
+    """Manga detail and library management"""
 
-    # Handle manga selection dari hasil search
-    if (
-        data.startswith('manga_')
-        or data.startswith('addlibrary_')
-        or data.startswith('remlibrary_')
-    ):
-        slug = data.split('_')[1]
-        results = context.user_data.get('search_results', {}).get('manga', [])
+    @staticmethod
+    def create_manga_data(manga: Dict[str, Any]) -> Dict[str, Any]:
+        """Create standardized manga data"""
+        return {
+            'slug': manga.get('slug', ''),
+            'title': html.escape(manga.get('title', 'Unknown'), quote=True),
+            'author': manga.get('author', 'Unknown'),
+            'artist': manga.get('artist', 'Unknown'),
+            'genres': json.loads(manga.get('genres', '[]')),
+            'status': manga.get('publication_status', 'Unknown'),
+            'langs': manga.get('translated_languages', ''),
+            'read_url': get_read_url(manga.get('slug')),
+            'description': manga.get('description', 'No description available')
+        }
 
-        chapters_index, lang = 0, None
-        if data.count(':'):
-            slug, chapters_index = slug.split(':')
-            chapters_index = int(chapters_index)
-        if data.count('/'):
-            slug, lang = slug.split('/')
-
-        if manga := next((m for m in results if m.get('slug') == slug), None):
-            manga_data = {
-                'title': manga.get('title', 'Unknown'),
-                'author': manga.get('author', 'Unknown'),
-                'artist': manga.get('artist', 'Unknown'),
-                'genres': json.loads(manga.get('genres', '[]')),
-                'status': manga.get('publication_status', 'Unknown'),
-                'langs': manga.get('translated_languages'),
-                'read_url': get_read_url(slug),
-                'description': manga.get('description', 'No description')
-            }
-            response, keyboard = manga_detail(data, slug, manga_data, str(user_id), chapters_index, lang)
-            keyboard.extend([[
-                InlineKeyboardButton("🔍 Searched", callback_data='search_results'),
-                InlineKeyboardButton("🏠 Menu", callback_data='main_menu')
-            ]])
-
-        elif manga_data := BOT_DATABASE.get(str(user_id), {}).get('Library', {}).get(slug):
-            response, keyboard = manga_detail(data, slug, manga_data, str(user_id), chapters_index, lang)
-            keyboard.extend([[
-                InlineKeyboardButton("📚 My Library", callback_data='user_library'),
-                InlineKeyboardButton("🏠 Menu", callback_data='main_menu')
-            ]])
-
-        else:
-            response = MESSAGES["manga_not_found"]
-            keyboard = [[InlineKeyboardButton("🏠 Menu", callback_data='main_menu')]]
-
-    elif data == 'search_results':
-        # Kembali ke hasil pencarian (butuh implementasi lebih lanjut)
-        context.user_data['search_mode'] = False
-        response, keyboard = search_results(
-            context.user_data.get('search_query'),
-            context.user_data.get('search_results', {})
-        )
-
-    elif data.startswith('user_'):
-        user_id = int(data.split('_')[1])
-
-    else:
-        response = MESSAGES["unknown_menu"]
-        return await main_menu_handler(update, context)
-
-    reply_markup = InlineKeyboardMarkup(keyboard)
-    try:
-        await query.edit_message_text(
-            text=response,
-            reply_markup=reply_markup,
-            parse_mode='HTML',
-            disable_web_page_preview=True
-        )
-    except Exception as e: printn(f"?91`{e}")
-
-def manga_detail(data: str, slug: str, manga_data: dict, user_id: str, chapters_index: int=0, lang=None) -> tuple[str, list]:
-    """Generate manga detail response and keyboard"""
-    # Library actions
-    if data.startswith('addlibrary_'):
-        BOT_DATABASE[user_id]['Library'][slug] = manga_data
-        status_msg = MESSAGES["added_to_library"]
-
-    elif data.startswith('remlibrary_'):
-        if BOT_DATABASE.get(user_id, {}).get('Library', {}).get(slug):
-            del BOT_DATABASE[user_id]['Library'][slug]
-            status_msg = MESSAGES["removed_from_library"]
-
-    # Library button
-    readlist_btn = InlineKeyboardButton("✚ Add to Library", callback_data=f'addlibrary_{slug}')
-    if BOT_DATABASE.get(user_id, {}).get('Library', {}).get(slug):
-        readlist_btn = InlineKeyboardButton("✅ In Library", callback_data=f'remlibrary_{slug}')
-
-    # Professional manga detail
-    response = "\n\n".join([
-        MESSAGES["manga_detail_title"].format(title=manga_data['title']),
-        MESSAGES["manga_author"].format(author=manga_data['author']),
-        MESSAGES["manga_artist"].format(artist=manga_data['artist']),
-        MESSAGES["manga_genre"].format(genres=', '.join(manga_data['genres'])),
-        MESSAGES["manga_status"].format(status=manga_data['status'].upper()),
-        MESSAGES["manga_languages"].format(langs=format_languages(manga_data['langs'])),
-        MESSAGES["manga_description"].format(description=manga_data['description'])
-    ])
-
-
-    buttons = []
-    chapters_data = ApiLunaranime.get_chapters(slug)
-    chapters = chapters_data['data']
-    langs = list(chapters.keys())
-    if not lang: lang = langs[0]
-
-    for chapter in list(reversed(chapters.get(lang, [])))[chapters_index:chapters_index+15]:
-        buttons.append(
-            InlineKeyboardButton(f"Chapter {chapter['chapter_number']}", web_app={"url": f"https://lunaranime.ru/manga/{slug}/{chapter['chapter_number']}?lang={lang}"})
-        )
-
-    keyboard = [
-        [readlist_btn, InlineKeyboardButton("🌐 Read Online", web_app={"url": manga_data['read_url']})],
-        [
-            InlineKeyboardButton("◀️", callback_data=f'manga_{slug}:{max(chapters_index-15, 0)}'),
-            InlineKeyboardButton(format_languages(f"[\"{lang}\"]"), callback_data=f'manga_{slug}/{langs[(langs.index(lang)+1) %len(langs)]}'),
-            InlineKeyboardButton("▶️", callback_data=f'manga_{slug}:{min(chapters_index+15, 15 * (chapters_data.get("count", 0)//15))}')
+    @staticmethod
+    def generate_detail_message(manga_data: Dict[str, Any]) -> str:
+        """Generate manga detail message"""
+        response_parts = [
+            MESSAGES["manga_detail_title"].format(title=manga_data['title']),
+            MESSAGES["manga_author"].format(author=manga_data['author']),
+            MESSAGES["manga_artist"].format(artist=manga_data['artist']),
+            MESSAGES["manga_genre"].format(genres=', '.join(manga_data['genres'])),
+            MESSAGES["manga_status"].format(
+                status=f"{get_status_emoji(manga_data['status'])} {manga_data['status'].upper()}"
+            ),
+            MESSAGES["manga_languages"].format(langs=format_languages(manga_data['langs'])),
+            MESSAGES["manga_description"].format(description=manga_data['description'])
         ]
-    ]
-    chunk_size = 3
-    keyboard.extend([buttons[i:i+chunk_size] for i in range(0, len(buttons), chunk_size)])
-    return response, keyboard
+        return "\n\n".join(response_parts)
 
-def search_results(search_query: str, results: dict) -> tuple[str, list]:
-    """Generate search results response and keyboard"""
-    manga_list: List[Dict[str, Any]] = results.get('manga', [])
-    total = results.get('total', 0)
-    page = results.get('page', 1)
-    total_pages = results.get('total_pages', 1)
+    @staticmethod
+    def generate_detail_keyboard(manga_id: str,
+                               manga_data: Dict[str, Any],
+                               user_id: str,
+                               chapters_index: int = 0,
+                               lang: str = None) -> List[List[InlineKeyboardButton]]:
+        """Generate manga detail keyboard"""
+        try:
+            chapters_data = ApiLunaranime.get_chapters(manga_data.get('slug'))
+            chapters = chapters_data.get('data', {})
+            langs = list(chapters.keys())
+            if not lang and langs: lang = langs[0]
 
-    if not manga_list:
-        response = f"{MESSAGES['no_results']}\n\n{MESSAGES['search_suggestions']}"
-        keyboard = [[InlineKeyboardButton("❌ Cancel", callback_data='main_menu')]]
-        return response, keyboard
+            # Chapter buttons
+            chapter_buttons = []
+            chapter_list = list(reversed(chapters.get(lang, [])))[chapters_index:chapters_index + config.max_search_results]
+            for chapter in chapter_list:
+                ch_num = chapter['chapter_number']
+                chapter_buttons.append(InlineKeyboardButton(
+                    f"Chapter {ch_num}",
+                    web_app={"url": f"https://lunaranime.ru/manga/{manga_data.get('slug')}/{ch_num}?lang={lang}"}
+                ))
+        except Exception as e:
+            logger.error(f"Failed to get chapters: {e}")
+            chapter_buttons = []
+            langs = []
 
-    responses = [
-        f"{MESSAGES['search_success'].format(search_query=search_query)}",
-        f"{MESSAGES['search_total'].format(total=total, page=page, total_pages=total_pages)}\n"
-    ]
+        # Library button
+        library_btn = InlineKeyboardButton(
+            "✚ Add to Library",
+            callback_data=f'addlibrary_{manga_id}:{chapters_index}:{lang or ""}'
+        )
+        if manga_id in db.get_library(str(user_id)):
+            library_btn = InlineKeyboardButton(
+                "✅ In Library",
+                callback_data=f'remlibrary_{manga_id}:{chapters_index}:{lang or ""}'
+            )
 
+        # Navigation
+        total_chapters = chapters_data.get("count", 0)
+        total_pages = max(1, (total_chapters + config.page_size - 1) // config.page_size)
+        current_page = chapters_index // config.page_size
+
+        nav_buttons = [
+            InlineKeyboardButton("◀️", callback_data=f'manga_{manga_id}:{max(chapters_index-config.page_size, 0)}:{lang or ""}'),
+            InlineKeyboardButton(format_languages(f'["{lang}"]'), callback_data=f'manga_{manga_id}:{chapters_index}:{langs[(langs.index(lang)+1) % len(langs)] if lang in langs else ""}'),
+            InlineKeyboardButton("▶️", callback_data=f'manga_{manga_id}:{min(chapters_index+config.page_size, config.page_size*(total_pages-1))}:{lang or ""}')
+        ]
+
+        keyboard = [
+            [library_btn, InlineKeyboardButton("🌐 Read Online", web_app={"url": manga_data['read_url']})],
+            nav_buttons
+        ]
+
+        # Add chapter buttons in chunks
+        for i in range(0, len(chapter_buttons), config.chunk_size):
+            keyboard.append(chapter_buttons[i:i + config.chunk_size])
+
+        return keyboard
+
+def generate_search_keyboard(results: Dict[str, Any], page: int, total_pages: int) -> List[List[InlineKeyboardButton]]:
+    """Generate search results keyboard"""
+    responses = []
+    keyboard = []
+
+    # Pagination
+    if total_pages > 1:
+        keyboard.append([
+            InlineKeyboardButton("◀️", callback_data=f'search:{max(page-1, 1)}'),
+            InlineKeyboardButton("▶️", callback_data=f'search:{min(page+1, total_pages)}')
+        ])
+
+    # Manga buttons
+    manga_list = results.get('manga', [])
     buttons = []
-    for index, manga in enumerate(manga_list, start=1):
-        slug = manga.get('slug', '')
+    for index, manga in enumerate(manga_list, start=1 + (config.page_size * (page - 1))):
+        manga_id = manga.get('manga_id')
         title = html.escape(manga.get('title', 'Unknown'), quote=True)
         langs = format_languages(manga.get('translated_languages', ''))
 
         responses.append(f"{index:0>2}). <b>{title} {langs}</b>")
-        buttons.append(
-            InlineKeyboardButton(f"{index}", callback_data=f"manga_{slug}")
-        )
+        buttons.append(InlineKeyboardButton(
+            f"{index:0>2}",
+            callback_data=f"manga_{manga_id}::"
+        ))
 
-    chunk_size = 5
-    keyboard = [buttons[i:i+chunk_size] for i in range(0, len(buttons), chunk_size)]
+    # Chunk buttons
+    for i in range(0, len(buttons), 5):
+        keyboard.append(buttons[i:i + 5])
 
-    response = "\n".join(responses)
-
-    if total_pages > 1:
-        keyboard.extend([[
-            InlineKeyboardButton("◀️ Page", callback_data='prevpage'),
-            InlineKeyboardButton("▶️ Page", callback_data='nextpage'),
-        ]])
-
-    keyboard.extend([[
+    keyboard.append([
         InlineKeyboardButton("🔍 Search", callback_data='search_mode'),
         InlineKeyboardButton("🏠 Menu", callback_data='main_menu')
-    ]])
+    ])
 
-    return response, keyboard
+    return '\n'.join(responses), keyboard
 
-# GLOBAL ERROR HANDLER
-async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Global error handler"""
-    logger.error(f"Update {update} caused error {context.error}")
-
-    if update and hasattr(update, 'callback_query') and update.callback_query:
-        try:
-            await update.callback_query.answer(
-                MESSAGES["error_occurred"],
-                show_alert=True
-            )
-        except: pass
-
-async def cleanup_job(context: ContextTypes.DEFAULT_TYPE):
-    """Auto cleanup"""
-    if context.user_data.get("state") == "search":
-        context.user_data.clear()
-        logger.info("Auto cleanup job")
-
-async def broadcast_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    try: await query.answer()
-    except: pass
-
-    context.user_data.update({
-        'state': 'broadcast',
-        'broadcast_mode': True,
-        "message_id": query.message.message_id,
-        "chat_id": query.message.chat_id,
-        "user_id": query.from_user.id
-    })
-
-    reply_markup = InlineKeyboardMarkup([[InlineKeyboardButton("❌ Cancel", callback_data='main_menu')]])
-    await query.edit_message_text(
-        text=MESSAGES["broadcast_mode"],
-        reply_markup=reply_markup,
-        parse_mode='HTML',
-        disable_web_page_preview=True
-    )
-
-    message = "Pesan broadcast default!"
-
-    # await context.bot.send_message(
-    #     chat_id=query.message.chat_id,
-    #     text=response,
-    #     reply_markup=reply_markup,
-    #     parse_mode='HTML',
-    #     disable_web_page_preview=True
-    # )
-
-async def notify_user_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    try: await query.answer()
-    except: pass
-
-    response = "List user:"
-
-    buttons = []
-    for user_id, data in BOT_DATABASE.items():
-        if int(user_id) in ADMIN_USER_ID: continue
-        buttons.append(InlineKeyboardButton(f"@{data['User']['username']}", callback_data=f"user_{user_id}"))
-
-    chunk_size = 2
-    keyboard = [buttons[i:i+chunk_size] for i in range(0, len(buttons), chunk_size)]
-    keyboard.extend([[InlineKeyboardButton("🏠 Menu", callback_data='main_menu')]])
-
-    reply_markup = InlineKeyboardMarkup(keyboard)
-    await query.edit_message_text(
-        text=response,
-        reply_markup=reply_markup,
-        parse_mode='HTML',
-        disable_web_page_preview=True
-    )
-
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Command /start"""
-    context.user_data.clear()
-
-    user = update.effective_user
-    user_id = str(user.id)
-    if not BOT_DATABASE.get(user_id):
-        BOT_DATABASE.update({
-            user_id: {
-                'User': {
-                    'first_name': user.first_name,
-                    'username': user.username,
-                    'is_bot': user.is_bot,
-                    'language_code': user.language_code
-                },
-                'Library': {}
-            }
-        })
-
-    await update.message.reply_html(
-        MESSAGES["welcome"].format(user_mention=user.mention_html(), lang=format_languages(f"[\"{user.language_code}\"]"), user_id=user_id),
-        reply_markup=await main_menu_keyboard(update),
-        protect_content=True,
-        disable_web_page_preview=True
-    )
-
-async def privacy_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Privacy policy handler"""
-    query = update.callback_query
-    await query.answer()
-
-    try: response = Path('privacy-policy.html').read_text(encoding='utf-8')
-    except: response = MESSAGES["privacy_not_available"]
-
-    keyboard = [
-        [
-            InlineKeyboardButton("🏠 Menu", callback_data='main_menu'),
-            InlineKeyboardButton("💬 Contact", url='https://t.me/ShenZhiiyi')
-        ]
-    ]
-
-    await query.edit_message_text(
-        text=response,
-        reply_markup=InlineKeyboardMarkup(keyboard),
-        parse_mode='HTML',
-        disable_web_page_preview=True
-    )
-
-async def main_menu_handler(update: Update, context: ContextTypes.DEFAULT_TYPE, start_mode=False):
-    """Menu utama"""
-    query = update.callback_query
-    try: await query.answer()
-    except: pass
-
-    context.user_data.clear()
-
-    reply_markup = await main_menu_keyboard(update)
-    if start_mode: return reply_markup
-
-    await query.edit_message_text(
-        text=MESSAGES["main_menu"],
-        reply_markup=reply_markup,
-        parse_mode='HTML',
-        disable_web_page_preview=True
-    )
-
-async def main_menu_keyboard(update: Update) -> InlineKeyboardMarkup:
+def generate_main_menu_keyboard(is_admin: bool = False) -> InlineKeyboardMarkup:
     """Generate main menu keyboard"""
     keyboard = [
         [
             InlineKeyboardButton("🔍 Search Manga", callback_data='search_mode'),
             InlineKeyboardButton("📚 My Library", callback_data='user_library')
         ],
+        [InlineKeyboardButton("🔍 Search User Projects", callback_data='search_user_projects_mode')],
         [InlineKeyboardButton("📄 Privacy Policy", callback_data='privacy')]
     ]
-    if update.effective_user.id in ADMIN_USER_ID:
+
+    if is_admin:
         keyboard.insert(1, [
-            InlineKeyboardButton("Broadcast", callback_data='broadcast_mode'),
-            InlineKeyboardButton("Notify User", callback_data='notify_user')
+            InlineKeyboardButton("📢 Broadcast", callback_data='broadcast_mode'),
+            InlineKeyboardButton("👥 Notify Users", callback_data='notify_user')
         ])
-        keyboard.insert(2, [
-            InlineKeyboardButton("Source Code", callback_data='source_code')
-        ])
+        keyboard.insert(2, [InlineKeyboardButton("💻 Source Code", callback_data='source_code')])
+
     return InlineKeyboardMarkup(keyboard)
 
-async def user_library_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+
+# Handlers
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle /start command"""
+    user = update.effective_user
+    user_id = str(user.id)
+
+    # Ensure user in database
+    user_info = {
+        'first_name': user.first_name or '',
+        'username': user.username or '',
+        'is_bot': user.is_bot,
+        'language_code': user.language_code or ''
+    }
+    db.ensure_user(user_id, user_info)
+
+    # Clear user data
+    context.user_data.clear()
+
+    await update.message.reply_html(
+        MESSAGES["welcome"].format(
+            user_mention=user.mention_html(),
+            user_id=user_id
+        ),
+        reply_markup=generate_main_menu_keyboard(user.id in config.admin_user_ids),
+        protect_content=True,
+        disable_web_page_preview=True
+    )
+
+async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Global error handler"""
+    logger.error(f"Update {update} caused error: {context.error}")
+
+    if (update and hasattr(update, 'callback_query') and
+        update.callback_query and update.callback_query.message):
+        try:
+            await update.callback_query.answer(
+                MESSAGES["error_occurred"], show_alert=True
+            )
+        except Exception: pass
+
+async def main_menu_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Main menu handler"""
+    query = update.callback_query
+    await query.answer()
+
+    context.user_data.clear()
+
+    reply_markup = generate_main_menu_keyboard(query.from_user.id in config.admin_user_ids)
+    await query.edit_message_text(
+        text=MESSAGES["main_menu"],
+        reply_markup=reply_markup,
+        parse_mode=ParseMode.HTML,
+        disable_web_page_preview=True
+    )
+
+async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Main button handler"""
     query = update.callback_query
     await query.answer()
 
     user_id = str(query.from_user.id)
-    readlist = BOT_DATABASE.get(user_id, {}).get('Library')
+    data = query.data
 
-    if not readlist:
-        keyboard = [[InlineKeyboardButton("🔍 Search Manga", callback_data='search_mode')]]
-        reply_markup = InlineKeyboardMarkup(keyboard)
-        await query.edit_message_text(
-            text=MESSAGES["library_empty"],
-            reply_markup=reply_markup,
-            parse_mode='HTML'
-        )
-        return
+    # Manga detail handling
+    if data.startswith(('manga_', 'addlibrary_', 'remlibrary_')):
+        try:
+            parts = data.split('_', 2)[1].split(':')
+            manga_id = parts[0]
+            chapters_index = int(parts[1]) if (len(parts) > 1 and parts[1]) else 0
+            lang = parts[2] if len(parts) > 2 else None
 
-    responses = [MESSAGES["my_library"]]
-    index = 1
-    buttons = []
+            # Get manga data
+            results = context.user_data.get('search_results', {}).get('manga', [])
+            manga = next((m for m in results if m.get('manga_id') == manga_id), None)
+            if manga:
+                keyboard_androwcol1 = InlineKeyboardButton("🔍 Searched", callback_data='search_results')
+                manga_data = MangaHandler.create_manga_data(manga)
 
-    for slug, data in readlist.items():
-        responses.append(f"{index:0>2}). <b>{html.escape(data.get('title', 'Unknown'), quote=True)} {format_languages(data['langs'])}</b>")
-        buttons.append(
-            InlineKeyboardButton(f"{index}", callback_data=f"manga_{slug}")
-        )
-        index += 1
+            else:
+                keyboard_androwcol1 = InlineKeyboardButton("📚 My Library", callback_data='user_library')
+                manga_data = db.get_library(user_id).get(manga_id)
 
-    chunk_size = 5
-    keyboard = [buttons[i:i+chunk_size] for i in range(0, len(buttons), chunk_size)]
-    response = "\n".join(responses)
+            if not manga and not manga_data:
+                reply_markup = InlineKeyboardMarkup([[InlineKeyboardButton("🏠 Menu", callback_data='main_menu')]])
+                await query.edit_message_text(
+                    text=MESSAGES["manga_not_found"],
+                    reply_markup=reply_markup,
+                    parse_mode=ParseMode.HTML
+                )
+                return
 
-    keyboard.extend([[InlineKeyboardButton("🏠 Menu", callback_data='main_menu')]])
+            # Handle library actions
+            if data.startswith('addlibrary_'):
+                db.get_library(user_id)[manga_id] = manga_data
+                db.set(user_id, db.get(user_id))
+            elif data.startswith('remlibrary_'):
+                library = db.get_library(user_id)
+                library.pop(manga_id, None)
+                db.set(user_id, db.get(user_id))
 
-    reply_markup = InlineKeyboardMarkup(keyboard)
-    await query.edit_message_text(
-        text=response,
-        reply_markup=reply_markup,
-        parse_mode='HTML',
-        disable_web_page_preview=True
-    )
+            # Generate response
+            response = MangaHandler.generate_detail_message(manga_data)
+            keyboard = MangaHandler.generate_detail_keyboard(
+                manga_id, manga_data, user_id, chapters_index, lang
+            )
 
-async def search_mode_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Aktifkan search mode"""
+            # Add navigation buttons
+            keyboard.extend([[
+                keyboard_androwcol1,
+                InlineKeyboardButton("🏠 Menu", callback_data='main_menu')
+            ]])
+
+            reply_markup = InlineKeyboardMarkup(keyboard)
+            await query.edit_message_text(
+                text=response,
+                reply_markup=reply_markup,
+                parse_mode=ParseMode.HTML,
+                disable_web_page_preview=True
+            )
+        except Exception as e:
+            logger.error(f"Manga handler error: {e}")
+            await query.answer(MESSAGES["error_occurred"], show_alert=True)
+
+    # Project detail handling
+    elif data.startswith('projects_'):
+        manga_id = data.split('_')[1]
+        # Get manga data
+        results = context.user_data.get('search_user_projects_results', [])
+        for manga_data in results:
+            if manga_data.get('manga_id') == manga_id:
+                manga = ApiLunaranime.function(manga_data.get('slug'))
+                manga_data = MangaHandler.create_manga_data(manga)
+
+                response = MangaHandler.generate_detail_message(manga_data)
+                keyboard = MangaHandler.generate_detail_keyboard(
+                    manga_id, manga_data, user_id
+                )
+
+                # Add navigation buttons
+                keyboard.extend([[
+                    InlineKeyboardButton("🔍 Searched Projects", callback_data='search_user_projects_results'),
+                    InlineKeyboardButton("🏠 Menu", callback_data='main_menu')
+                ]])
+
+                reply_markup = InlineKeyboardMarkup(keyboard)
+                await query.edit_message_text(
+                    text=response,
+                    reply_markup=reply_markup,
+                    parse_mode=ParseMode.HTML,
+                    disable_web_page_preview=True
+                )
+                break
+
+    # Search pagination
+    elif data.startswith('search:'):
+        context.user_data['search_page'] = int(data.split(':')[1])
+        await get_search_query(update, context)
+        # await search_mode_handler(update, context)
+
+    # Library pagination
+    elif data.startswith('library:'):
+        context.user_data['library_index'] = int(data.split(':')[1])
+        await user_library_handler(update, context)
+
+    # Projects pagination
+    elif data.startswith('projects:'):
+        context.user_data['search_user_projects_index'] = int(data.split(':')[1])
+        await search_user_projects_results(update, context)
+
+    # Mode handlers
+    elif data == 'search_results': await get_search_query(update, context)
+    elif data == 'search_mode': await search_mode_handler(update, context)
+    elif data == 'user_library': await user_library_handler(update, context)
+    elif data == 'search_user_projects_mode': await search_user_projects_handler(update, context)
+    elif data == 'search_user_projects_results': await search_user_projects_results(update, context)
+
+    elif data == 'broadcast_mode': await broadcast_handler(update, context)
+    elif data == 'notify_user': await notify_user_handler(update, context)
+    elif data == 'source_code': await admin_source_handler(update, context)
+    elif data == 'privacy': await privacy_handler(update, context)
+    else: await main_menu_handler(update, context)
+
+async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle text messages"""
+    if not context.user_data.get('state'): return
+
+    message = update.message
+    text = message.text.strip()
+
+    # Delete user message
+    try: await message.delete()
+    except TelegramError: pass
+
+    state = context.user_data.get('state')
+
+    if state == 'search':
+        context.user_data['search_query'] = text
+        await get_search_query(update, context)
+
+    elif state == 'search_user_projects':
+        context.user_data['search_user_projects_query'] = text
+        await get_user_projects(update, context)
+
+    elif state == 'broadcast':
+        await broadcast_message(update, context, text)
+
+async def search_mode_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Search mode activation"""
     query = update.callback_query
     await query.answer()
 
@@ -631,299 +653,477 @@ async def search_mode_handler(update: Update, context: ContextTypes.DEFAULT_TYPE
         'search_query': '',
         'search_results': {},
         'search_page': 1,
-        'search_mode': True,
-        "message_id": query.message.message_id,
-        "chat_id": query.message.chat_id,
-        "user_id": query.from_user.id
+        'message_id': query.message.message_id,
+        'chat_id': query.message.chat_id
     })
 
     reply_markup = InlineKeyboardMarkup([[InlineKeyboardButton("❌ Cancel", callback_data='main_menu')]])
     await query.edit_message_text(
         text=MESSAGES["search_mode"],
         reply_markup=reply_markup,
-        parse_mode='HTML',
+        parse_mode=ParseMode.HTML,
         disable_web_page_preview=True
     )
 
-async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Proses pesan search"""
-    message = update.message
-    search_query = message.text.strip()
+async def get_search_query(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Process search query"""
     user_data = context.user_data
+    search_query = user_data.get("search_query", "").strip()
+    search_page = user_data.get("search_page", 1)
     chat_id = user_data.get("chat_id")
     message_id = user_data.get("message_id")
 
-    # Hapus pesan user
-    try: await update.message.delete()
-    except TelegramError: pass
-
-    if user_data.get("state") not in ["search", "broadcast"]:
-        return
-
-    if user_data.get("state") == "broadcast":
-        success_count = 0
-        for user_id in BOT_DATABASE.keys():
-            if int(user_id) in ADMIN_USER_ID: continue
-            try:
-                await context.bot.send_message(chat_id=int(user_id), text=update.message.text, protect_content=True, disable_web_page_preview=True)
-                success_count += 1
-            except: continue
-
-        reply_markup = await main_menu_keyboard(update)
+    try:
+        # Show loading
         await context.bot.edit_message_text(
             chat_id=chat_id,
             message_id=message_id,
-            text=MESSAGES["main_menu"],
-            reply_markup=reply_markup,
-            parse_mode='HTML',
-            disable_web_page_preview=True
+            text=MESSAGES["searching"].format(query=search_query),
+            parse_mode=ParseMode.HTML
         )
 
-        await MessageManager.send_temp(
-            context,
-            update.effective_chat.id,
-            f"📤 Broadcast terkirim ke {success_count} user",
-            delay=10
-        )
+        # Search
+        results = ApiLunaranime.search_manga(query=search_query, page=search_page)
 
-    if user_data.get("state") == "search":
-        try:
-            # Kirim loading message
-            loading_msg = await context.bot.edit_message_text(
-                chat_id=chat_id,
-                message_id=message_id,
-                text=MESSAGES["searching"].format(query=search_query),
-                parse_mode='HTML',
-                disable_web_page_preview=True
-            )
+        if results and results.get('message') == 'success':
+            user_data['search_results'] = results
+            total = results.get('total', 0)
+            total_pages = results.get('total_pages', 1)
 
-            # Search manga
-            results = ApiLunaranime.search_manga(query=search_query)
-            ApiLunaranime.save_to_json(results)
+            response = "\n".join([
+                MESSAGES["search_success"].format(search_query=search_query),
+                MESSAGES["search_total"].format(total=total, page=search_page, total_pages=total_pages)
+            ])
 
-            if results and results.get('message') == 'success':
-                response, keyboard = search_results(search_query, results)
-                context.user_data.update({
-                    'search_query': search_query,
-                    'search_results': results
-                })
+            if not results.get('manga'):
+                response += f"\n\n{MESSAGES['no_results'].format(search_query=search_query)}\n\n{MESSAGES['search_suggestions']}"
 
-            else:
-                response = MESSAGES["api_error"]
-                keyboard = [[
-                    InlineKeyboardButton("🔍 Search", callback_data='search_mode'),
-                    InlineKeyboardButton("🏠 Menu", callback_data='main_menu')
-                ]]
+            responses, keyboard = generate_search_keyboard(results, search_page, total_pages)
+            response += f"\n\n{responses}\n"
 
-        except Exception as e:
-            logger.error(f"Search error: {e}")
-            response = MESSAGES["search_error"].format(error=str(e)[:100])
+        else:
+            response = MESSAGES["api_error"]
             keyboard = [[
                 InlineKeyboardButton("🔍 Search", callback_data='search_mode'),
                 InlineKeyboardButton("🏠 Menu", callback_data='main_menu')
             ]]
 
-        reply_markup = InlineKeyboardMarkup(keyboard)
-        await loading_msg.edit_text(response, reply_markup=reply_markup, parse_mode='HTML')
+    except Exception as e:
+        logger.error(f"Search error: {e}")
+        response = MESSAGES["search_error"].format(error=str(e)[:100])
+        keyboard = [[InlineKeyboardButton("🏠 Menu", callback_data='main_menu')]]
 
-async def admin_source_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Kirim source code untuk admin only"""
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    await context.bot.edit_message_text(
+        text=response,
+        chat_id=chat_id,
+        message_id=message_id,
+        reply_markup=reply_markup,
+        parse_mode=ParseMode.HTML,
+        disable_web_page_preview=True
+    )
+
+async def user_library_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """User library handler"""
+    query = update.callback_query
+    await query.answer()
+
+    user_id = str(query.from_user.id)
+    library_index = context.user_data.get('library_index', 0)
+
+    library = db.get_library(user_id)
+    if not library:
+        keyboard = [[InlineKeyboardButton("🔍 Search Manga", callback_data='search_mode')]]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        await query.edit_message_text(
+            text=MESSAGES["library_empty"],
+            reply_markup=reply_markup,
+            parse_mode=ParseMode.HTML
+        )
+        return
+
+    page_size = config.page_size
+    total_items = len(library)
+    total_pages = math.ceil(total_items / page_size)
+    current_page = library_index // page_size
+
+    responses = [MESSAGES["my_library"]]
+    buttons = []
+
+    library_items = list(library.items())[library_index:library_index + page_size]
+    for idx, (manga_id, data) in enumerate(library_items, start=library_index + 1):
+        title = data.get('title', 'Unknown')
+        responses.append(f"{idx:0>2}). <b>{title}</b> {format_languages(data.get('langs', ''))}")
+        buttons.append(InlineKeyboardButton(f"{idx:0>2}", callback_data=f"manga_{manga_id}::"))
+
+    keyboard = []
+    if total_items > page_size:
+        keyboard.append([
+            InlineKeyboardButton("◀️", callback_data=f'library:{max(library_index-page_size, 0)}'),
+            InlineKeyboardButton("▶️", callback_data=f'library:{min(library_index+page_size, page_size*(total_pages-1))}'),
+        ])
+
+    for i in range(0, len(buttons), 5):
+        keyboard.append(buttons[i:i + 5])
+
+    keyboard.append([InlineKeyboardButton("🏠 Menu", callback_data='main_menu')])
+
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    await query.edit_message_text(
+        text="\n".join(responses),
+        reply_markup=reply_markup,
+        parse_mode=ParseMode.HTML,
+        disable_web_page_preview=True
+    )
+
+async def search_user_projects_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Search user projects mode"""
+    query = update.callback_query
+    await query.answer()
+
+    context.user_data.update({
+        'state': 'search_user_projects',
+        'search_user_projects_query': '',
+        'search_user_projects_results': [],
+        'search_user_projects_index': 0,
+        'message_id': query.message.message_id,
+        'chat_id': query.message.chat_id
+    })
+
+    reply_markup = InlineKeyboardMarkup([[InlineKeyboardButton("❌ Cancel", callback_data='main_menu')]])
+    await query.edit_message_text(
+        text=MESSAGES["search_user_projects_mode"],
+        reply_markup=reply_markup,
+        parse_mode=ParseMode.HTML
+    )
+
+async def get_user_projects(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Get user projects"""
+    user_data = context.user_data
+    query = user_data.get("search_user_projects_query")
+    chat_id = user_data.get("chat_id")
+    message_id = user_data.get("message_id")
+
+    try:
+        await context.bot.edit_message_text(
+            chat_id=chat_id,
+            message_id=message_id,
+            text=MESSAGES["searching"].format(query=query),
+            parse_mode=ParseMode.HTML
+        )
+
+        user = ApiLunaranime.search_profile(query)
+        if data := user.get('data'):
+            projects = ApiLunaranime.get_user_projects(data['user_id'])
+            user_data.update({
+                'search_user_projects_query': data['username'],
+                'search_user_projects_results': projects
+            })
+            await search_user_projects_results(update, context)
+            return
+
+        else:
+            response = f"❌ User <code>{query}</code> not found"
+            keyboard = [[InlineKeyboardButton("🏠 Menu", callback_data='main_menu')]]
+
+    except Exception as e:
+        logger.error(f"User projects error: {e}")
+        response = MESSAGES["search_error"].format(error=str(e)[:100])
+        keyboard = [[InlineKeyboardButton("🏠 Menu", callback_data='main_menu')]]
+
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    await context.bot.edit_message_text(
+        text=response,
+        chat_id=chat_id,
+        message_id=message_id,
+        reply_markup=reply_markup,
+        parse_mode=ParseMode.HTML
+    )
+
+async def search_user_projects_results(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Display user projects results"""
+    user_data = context.user_data
+    projects = user_data.get("search_user_projects_results", [])
+    query = user_data.get("search_user_projects_query", "")
+    projects_index = user_data.get("search_user_projects_index", 0)
+    chat_id = user_data.get("chat_id")
+    message_id = user_data.get("message_id")
+
+    page_size = config.page_size
+    total = len(projects)
+    page = (projects_index // page_size) + 1
+    total_pages = math.ceil(total / page_size)
+
+    responses = [
+        f"✅ <b>User Projects</b> for <code>{query}</code>",
+        f"📊 <b>{total} projects found</b> | Page {page}/{total_pages}\n"
+    ]
+
+    keyboard = []
+    if total > page_size:
+        keyboard.append([
+            InlineKeyboardButton("◀️", callback_data=f'projects:{max(projects_index-page_size, 0)}'),
+            InlineKeyboardButton("▶️", callback_data=f'projects:{min(projects_index+page_size, page_size*(total_pages-1))}'),
+        ])
+
+    buttons = []
+    for idx, project in enumerate(projects[projects_index:projects_index+page_size], start=projects_index+1):
+        manga_id = project['manga_id']
+        title = html.escape(project.get('title', 'Unknown'), quote=True)
+        status = project.get('status', '')
+        responses.append(f"{idx:0>2}). <b>{title}</b> {get_status_emoji(status)}")
+        buttons.append(InlineKeyboardButton(f"{idx:0>2}", callback_data=f"projects_{manga_id}"))
+
+    for i in range(0, len(buttons), 5):
+        keyboard.append(buttons[i:i + 5])
+
+    keyboard.append([
+        InlineKeyboardButton("🔍 Search Projects", callback_data='search_user_projects_mode'),
+        InlineKeyboardButton("🏠 Menu", callback_data='main_menu')
+    ])
+
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    await context.bot.edit_message_text(
+        text="\n".join(responses),
+        chat_id=chat_id,
+        message_id=message_id,
+        reply_markup=reply_markup,
+        parse_mode=ParseMode.HTML
+    )
+
+async def broadcast_message(update: Update, context: ContextTypes.DEFAULT_TYPE, message_text: str) -> None:
+    """Broadcast message to all users"""
+    user_data = context.user_data
+    chat_id = user_data.get("chat_id")
+    message_id = user_data.get("message_id")
+
+    success_count = 0
+    for user_id_str, user_data in db._data.items():
+        user_id = int(user_id_str)
+        if user_id in config.admin_user_ids:
+            continue
+
+        try:
+            await context.bot.send_message(
+                chat_id=user_id,
+                text=message_text,
+                protect_content=True,
+                disable_web_page_preview=True
+            )
+            success_count += 1
+            await asyncio.sleep(0.05)  # Rate limit
+        except Exception:
+            continue
+
+    reply_markup = generate_main_menu_keyboard(update.effective_user.id in config.admin_user_ids)
+    await context.bot.edit_message_text(
+        text=MESSAGES["main_menu"],
+        chat_id=chat_id,
+        message_id=message_id,
+        reply_markup=reply_markup,
+        parse_mode=ParseMode.HTML
+    )
+
+    await MessageManager.send_temp(
+        context, update.effective_chat.id,
+        MESSAGES["broadcast_success"].format(count=success_count)
+    )
+
+async def broadcast_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Broadcast mode handler"""
     query = update.callback_query
     user_id = query.from_user.id
 
-    if user_id not in ADMIN_USER_ID:
+    if user_id not in config.admin_user_ids:
         await query.answer("❌ Admin only!", show_alert=True)
         return
 
-    await query.answer("📤 Mengirim source code...")
+    await query.answer()
+    context.user_data.update({
+        'state': 'broadcast',
+        'message_id': query.message.message_id,
+        'chat_id': query.message.chat_id
+    })
 
-    files = [
-        ('LunaranimeBot-AIVersion.py', '🤖 Main Bot'),
+    reply_markup = InlineKeyboardMarkup([[InlineKeyboardButton("❌ Cancel", callback_data='main_menu')]])
+    await query.edit_message_text(
+        text=MESSAGES["broadcast_mode"],
+        reply_markup=reply_markup,
+        parse_mode=ParseMode.HTML
+    )
+
+async def notify_user_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Notify users handler (admin)"""
+    query = update.callback_query
+    if query.from_user.id not in config.admin_user_ids:
+        await query.answer("❌ Admin only!", show_alert=True)
+        return
+
+    await query.answer()
+
+    buttons = []
+    for user_id_str, data in db._data.items():
+        user_id = int(user_id_str)
+        if user_id in config.admin_user_ids: continue
+        username = data['User'].get('username', f"User_{user_id}")
+        buttons.append(InlineKeyboardButton(f"@{username}", callback_data=f"user_{user_id}"))
+
+    keyboard = []
+    for i in range(0, len(buttons), 2):
+        keyboard.append(buttons[i:i + 2])
+    keyboard.append([InlineKeyboardButton("🏠 Menu", callback_data='main_menu')])
+
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    await query.edit_message_text(
+        text="👥 <b>Select user to notify:</b>",
+        reply_markup=reply_markup,
+        parse_mode=ParseMode.HTML
+    )
+
+async def admin_source_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Send source code (admin only)"""
+    query = update.callback_query
+    if query.from_user.id not in config.admin_user_ids:
+        await query.answer("❌ Admin only!", show_alert=True)
+        return
+
+    await query.answer("📤 Preparing source files...")
+
+    source_files = [
+        ('LunaranimeBot.V3.py', '🤖 Main Bot'),
         ('ApiLunaranime.py', '🌙 API Wrapper'),
-        ('.LunaranimeBot.db.json', '📋 Dependencies'),
-        ('privacy-policy.html', '📋 Dependencies')
+        ('.LunaranimeBot.db.json', '📊 Database'),
+        ('privacy-policy.html', '📄 Privacy Policy')
     ]
 
-    for file_path, caption in files:
-        if Path(file_path).exists():
+    chat_id = query.message.chat_id
+    for file_path, caption in source_files:
+        file = Path(file_path)
+        if file.exists():
             try:
-                message = await context.bot.send_document(
-                    chat_id=query.message.chat_id,
-                    document=open(file_path, 'rb'),
-                    caption=f"{caption}\nPath: `{file_path}`",
-                    filename=Path(file_path).name,
-                    parse_mode='Markdown',
-                    protect_content=True
-                )
+                with open(file, 'rb') as f:
+                    message = await context.bot.send_document(
+                        chat_id=chat_id,
+                        document=f,
+                        caption=f"{caption}\n<code>{file_path}</code>",
+                        filename=file.name,
+                        parse_mode=ParseMode.HTML,
+                        protect_content=True
+                    )
 
-                # Schedule deletion
-                chat_id = update.effective_chat.id
+                # Auto-delete after 5 minutes
                 context.job_queue.run_once(
                     MessageManager._delete_message,
-                    when=60,
-                    data={'chat_id': chat_id, 'message_id': message.message_id},
-                    name=f"del_{message.message_id}"
+                    when=300,
+                    data={'chat_id': chat_id, 'message_id': message.message_id}
                 )
             except Exception as e:
                 logger.error(f"Failed to send {file_path}: {e}")
 
     await MessageManager.send_temp(
-        context,
-        update.effective_chat.id,
-        "✅ Semua file source code telah dikirim! 🎉",
-        delay=60
+        context, chat_id,
+        "✅ <b>All source files sent successfully!</b>\n🎉 Thank you for your support!"
     )
 
-ADMIN_UPLOAD_DIR = Path("admin_uploads")
-ADMIN_UPLOAD_DIR.mkdir(exist_ok=True)
+async def privacy_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Privacy policy handler"""
+    query = update.callback_query
+    await query.answer()
 
-async def admin_file_receiver_hendler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Admin only file receiver"""
-    user_id = update.effective_user.id
-    if user_id not in ADMIN_USER_ID:
-        await update.message.reply_text("❌ Admin only!")
-        return
+    privacy_file = Path('privacy-policy.html')
+    try: response = privacy_file.read_text(encoding='utf-8')
+    except FileNotFoundError: response = MESSAGES["privacy_not_available"]
 
-    message = update.message
-    file = message.document
-    if not file: return
+    keyboard = [[
+        InlineKeyboardButton("🏠 Menu", callback_data='main_menu'),
+        InlineKeyboardButton("💬 Contact", url='https://t.me/ShenZhiiyi')
+    ]]
 
-    # Validasi
-    allowed_types = ['.pdf', '.jpg', '.png', '.zip', '.py', '.txt', '.json', '.mp4', '.mp3']
-    if not any(file.file_name.lower().endswith(ext) for ext in allowed_types):
-        await message.reply_text("❌ Tipe file tidak diizinkan!")
-        return
+    await query.edit_message_text(
+        text=response,
+        reply_markup=InlineKeyboardMarkup(keyboard),
+        parse_mode=ParseMode.HTML,
+        disable_web_page_preview=True
+    )
 
-    if file.file_size > 20 * 1024 * 1024:  # 20MB
-        await message.reply_text("❌ File terlalu besar! Max 20MB")
-        return
+async def cleanup_job(context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Periodic cleanup of user states"""
+    for job in context.job_queue.jobs():
+        if job.name and job.name.startswith('cleanup_'):
+            job.schedule_removal()
 
-    # Sanitize filename
-    safe_name = re.sub(r'[^\w\-\.]', '_', file.file_name)
-    file_path = ADMIN_UPLOAD_DIR / safe_name
-
-    try:
-        telegram_file = await context.bot.get_file(file.file_id)
-        await telegram_file.download_to_drive(file_path)
-
-        # Hapus pesan user
-        try: await message.delete()
-        except TelegramError: pass
-
-        await MessageManager.send_temp(
-            context,
-            update.effective_chat.id,
-            f"🖼️ <b>File diterima admin!</b>\n\n"
-            f"📁 <code>{file_path.absolute()}</code>\n"
-            f"📊 {file_path.stat().st_size / 1024:.1f} KB\n"
-            f"👤 Dari: {update.effective_user.mention_html()}",
-            delay=10
-        )
-
-        # Log
-        logger.info(f"Admin {user_id} uploaded: {file_path}")
-
-    except Exception as e:
-        await MessageManager.send_temp(
-            context,
-            update.effective_chat.id,
-            f"❌ Upload gagal: {str(e)}",
-            delay=10
-        )
-
-async def admin_photo_receiver_hendler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Download foto ke server"""
-    message = update.message
-    user = update.effective_user
-    photo = message.photo[-1]  # Best quality
-
-    try:
-        # Get file
-        photo_file = await context.bot.get_file(photo.file_id)
-
-        # Unique filename
-        timestamp = int(time.time())
-        ext = photo_file.file_path.split('.')[-1] if '.' in photo_file.file_path else 'jpg'
-        filename = f"{timestamp}_{photo.width}x{photo.height}.{ext}"
-        file_path = ADMIN_UPLOAD_DIR / filename
-
-        # Download
-        await photo_file.download_to_drive(file_path)
-
-        # Hapus pesan user
-        try: await message.delete()
-        except TelegramError: pass
-
-        await MessageManager.send_temp(
-            context,
-            update.effective_chat.id,
-            f"🖼️ <b>Foto diterima admin!</b>\n\n"
-            f"📁 `{file_path.absolute()}`\n"
-            f"📏 Ukuran: {photo.width}x{photo.height}\n"
-            f"📊 {file_path.stat().st_size / 1024:.1f} KB\n"
-            f"👤 Dari: {user.mention_html()}",
-            delay=10
-        )
-
-        logger.info(f"Photo {photo.width}x{photo.height} from {user.id}")
-
-    except Exception as e:
-        await MessageManager.send_temp(
-            context,
-            update.effective_chat.id,
-            f"❌ Gagal simpan foto: {str(e)}",
-            delay=10
-        )
+    # Cleanup inactive search states
+    current_time = time.time()
+    for chat_data in context.bot_data.setdefault('chat_states', {}).values():
+        if current_time - chat_data.get('last_activity', 0) > 300:  # 5 minutes
+            chat_data.clear()
 
 
-def atexit() -> None:
-    import atexit
-    UIColor.clear_screen()
-    UIColor.set_title('LunaranimeBot')
-    __import__('atexit').register(lambda:(
-        UIColor.set_title(''),
-        DB_FILE.write_bytes(
-            json.dumps(BOT_DATABASE, separators=(',', ':'), ensure_ascii=False).encode('utf-8')
-        )
-    ))
+def save_database_on_exit() -> None:
+    """Save database on exit"""
+    db._save()
+    logger.info("Database saved on exit")
 
 def main() -> None:
-    """Start the bot."""
-    if not BOT_TOKEN: UIColor.exit_with_msg("❌ Error: BOT_TOKEN not set.")
+    """Main application entry point"""
+    if not config.bot_token:
+        logger.error("BOT_TOKEN not set")
+        sys.exit(1)
 
-    app = ApplicationBuilder().token(BOT_TOKEN).job_queue(JobQueue()).build()
+    UIColor.clear_screen()
+    UIColor.set_title('LunaranimeBot')
+    # Register exit handler
+    atexit.register(save_database_on_exit)
 
-    # Handlers
+    # Create application
+    app = (
+        ApplicationBuilder()
+        .token(config.bot_token)
+        .read_timeout(30)
+        .write_timeout(30)
+        .connect_timeout(30)
+        .pool_timeout(30)
+        .job_queue(JobQueue())
+        .build()
+    )
+
+    # Handlers registration
     app.add_handler(CommandHandler('start', start))
-    app.add_handler(CallbackQueryHandler(privacy_handler, pattern='privacy'))
-    app.add_handler(CallbackQueryHandler(main_menu_handler, pattern='main_menu'))
-    app.add_handler(CallbackQueryHandler(notify_user_handler, pattern='notify_user'))
-    app.add_handler(CallbackQueryHandler(broadcast_handler, pattern='broadcast_mode'))
-    app.add_handler(CallbackQueryHandler(search_mode_handler, pattern='search_mode'))
-    app.add_handler(CallbackQueryHandler(user_library_handler, pattern='user_library'))
 
-    app.add_handler(CallbackQueryHandler(admin_source_handler, pattern='source_code'))
+    # Callback query handlers
+    app.add_handler(CallbackQueryHandler(main_menu_handler, pattern='^main_menu$'))
     app.add_handler(CallbackQueryHandler(button_handler))
+    app.add_handler(CallbackQueryHandler(privacy_handler, pattern='^privacy$'))
 
+    # Admin handlers
+    app.add_handler(CallbackQueryHandler(broadcast_handler, pattern='^broadcast_mode$'))
+    app.add_handler(CallbackQueryHandler(notify_user_handler, pattern='^notify_user$'))
+    app.add_handler(CallbackQueryHandler(admin_source_handler, pattern='^source_code$'))
+
+    # Mode handlers
+    app.add_handler(CallbackQueryHandler(search_mode_handler, pattern='^search_mode$'))
+    app.add_handler(CallbackQueryHandler(user_library_handler, pattern='^user_library$'))
+    app.add_handler(CallbackQueryHandler(search_user_projects_handler, pattern='^search_user_projects_mode$'))
+
+    # Message handler
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, message_handler))
-    app.add_handler(MessageHandler(
-        filters.PHOTO & filters.User(user_id=ADMIN_USER_ID),
-        admin_photo_receiver_hendler
-    ))
-    app.add_handler(MessageHandler(
-        filters.Document.ALL & filters.User(user_id=ADMIN_USER_ID),
-        admin_file_receiver_hendler
-    ))
+
+    # Error handler
     app.add_error_handler(error_handler)
 
-    # Auto cleanup
+    # Periodic cleanup
     app.job_queue.run_repeating(cleanup_job, interval=300, first=60)
 
-    printn("🚀 Bot started!")
-    printn("Bot is running...")
+    logger.info("🚀 Lunaranime Bot started successfully!")
+    logger.info("Bot is now running...")
 
-    app.run_polling()
+    # Run bot
+    app.run_polling(
+        allowed_updates=Update.ALL_TYPES,
+        drop_pending_updates=True,
+        close_loop=False
+    )
 
 if __name__ == "__main__":
-    atexit()
+    import asyncio
     main()
