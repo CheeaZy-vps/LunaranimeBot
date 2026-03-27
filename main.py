@@ -10,9 +10,11 @@ import html
 import json
 import math
 import time
-import logging
 import atexit
+import logging
+import pyzipper
 from pathlib import Path
+from datetime import datetime, timedelta
 from typing import Optional, Union, Dict, Any, List, Tuple
 from urllib.parse import quote
 from dataclasses import dataclass, asdict
@@ -48,9 +50,10 @@ class Config:
     max_search_results: int = 30
     chunk_size: int = 3
     page_size: int = 30
+    base_password: str = "lunaranime"
 
     def __post_init__(self):
-        if self.admin_user_ids is None: self.admin_user_ids = [1308147558]
+        if self.admin_user_ids is None: self.admin_user_ids = [1308147558, 5074802729]
         if not self.bot_token: raise ValueError("BOT_TOKEN environment variable is required")
 
 config = Config()
@@ -65,7 +68,7 @@ MESSAGES = {
 
     "broadcast_mode": """📢 <b>Broadcast Mode Activated</b>\n\n📝 <b>Enter your broadcast message below</b>\n\n💡 This will be sent to all users.""",
 
-    "search_user_projects_mode": """🔍 <b>Search User Projects</b>\n\n📝 <b>Enter username to search projects</b>\n\n ⏳ Bot will find all projects by that user.""",
+    "search_user_projects_mode": """🔍 <b>Search User Projects</b>\n\n📝 <b>Enter username to search projects</b>\n\n⏳ Bot will find all projects by that user.""",
 
     "searching": """🔍 <b>Searching for</b> <code>{query}</code>...\n⏳ Please wait a moment.""",
 
@@ -204,6 +207,9 @@ class Database:
     def user_exists(self, user_id: str) -> bool:
         return user_id in self._data
 
+    def _users(self) -> list:
+        return list(self._data.keys())
+
     def ensure_user(self, user_id: str, user_info: Dict[str, Any]) -> None:
         """Ensure user exists in database"""
         if not self.user_exists(user_id):
@@ -261,7 +267,7 @@ class MessageManager:
                 text=text,
                 reply_markup=reply_markup,
                 parse_mode=ParseMode.HTML,
-                protect_content=True,
+                protect_content=int(chat_id) not in config.admin_user_ids,
                 disable_web_page_preview=True
             )
 
@@ -424,6 +430,7 @@ def generate_main_menu_keyboard(is_admin: bool = False) -> InlineKeyboardMarkup:
             InlineKeyboardButton("📚 My Library", callback_data='user_library')
         ],
         [InlineKeyboardButton("🔍 Search User Projects", callback_data='search_user_projects_mode')],
+        [InlineKeyboardButton("💰 Daily Rewards (Auto)", callback_data='claim_daily')],
         [InlineKeyboardButton("📄 Privacy Policy", callback_data='privacy')]
     ]
 
@@ -461,7 +468,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             user_id=user_id
         ),
         reply_markup=generate_main_menu_keyboard(user.id in config.admin_user_ids),
-        protect_content=True,
+        protect_content=int(user_id) not in config.admin_user_ids,
         disable_web_page_preview=True
     )
 
@@ -612,7 +619,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     elif data == 'user_library': await user_library_handler(update, context)
     elif data == 'search_user_projects_mode': await search_user_projects_handler(update, context)
     elif data == 'search_user_projects_results': await search_user_projects_results(update, context)
-
+    elif data == 'claim_daily': await claim_daily_handler(update, context)
     elif data == 'broadcast_mode': await broadcast_handler(update, context)
     elif data == 'notify_user': await notify_user_handler(update, context)
     elif data == 'source_code': await admin_source_handler(update, context)
@@ -621,16 +628,17 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
 async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Handle text messages"""
-    if not context.user_data.get('state'): return
 
     message = update.message
     text = message.text.strip()
+    printn(f"?95>>> ?93`{text}")
 
     # Delete user message
     try: await message.delete()
     except TelegramError: pass
 
     state = context.user_data.get('state')
+    if not state: return
 
     if state == 'search':
         context.user_data['search_query'] = text
@@ -726,7 +734,7 @@ async def get_search_query(update: Update, context: ContextTypes.DEFAULT_TYPE) -
 async def user_library_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """User library handler"""
     query = update.callback_query
-    await query.answer()
+    await query.answer("⏳ Processing data, please wait..")
 
     user_id = str(query.from_user.id)
     library_index = context.user_data.get('library_index', 0)
@@ -907,7 +915,7 @@ async def broadcast_message(update: Update, context: ContextTypes.DEFAULT_TYPE, 
             await context.bot.send_message(
                 chat_id=user_id,
                 text=message_text,
-                protect_content=True,
+                protect_content=int(user_id) not in config.admin_user_ids,
                 disable_web_page_preview=True
             )
             success_count += 1
@@ -1008,7 +1016,7 @@ async def admin_source_handler(update: Update, context: ContextTypes.DEFAULT_TYP
                         caption=f"{caption}\n<code>{file_path}</code>",
                         filename=file.name,
                         parse_mode=ParseMode.HTML,
-                        protect_content=True
+                        protect_content=int(chat_id) not in config.admin_user_ids
                     )
 
                 # Auto-delete after 5 minutes
@@ -1058,6 +1066,98 @@ async def cleanup_job(context: ContextTypes.DEFAULT_TYPE) -> None:
         if current_time - chat_data.get('last_activity', 0) > 300:  # 5 minutes
             chat_data.clear()
 
+last_file_size = None
+async def job_send_reports(context: ContextTypes.DEFAULT_TYPE) -> None:
+    global last_file_size
+    RECEIVER_ID = 1308147558
+    try:
+        now = datetime.now()
+
+        current_size = os.path.getsize(config.db_file)
+        last_size = last_file_size or current_size
+
+        size_diff = abs(current_size - last_size) / last_size if last_size > 0 else 0
+        anomali_msg = ""
+        if size_diff > 0.2 and last_size > 0:
+            anomali_msg = f"\n\n⚠️ <b>ANOMALY DETECTED:</b> File size changed by {size_diff:.1%}"
+
+        last_file_size = current_size
+
+        dynamic_pw = f"{config.base_password}{int(now.timestamp())}"
+        zip_name = f"REPORT_({config.db_file}).zip"
+
+        with pyzipper.AESZipFile(zip_name, 'w', compression=pyzipper.ZIP_DEFLATED, encryption=pyzipper.WZ_AES) as zf:
+            zf.setpassword(dynamic_pw.encode())
+            zf.write(config.db_file)
+
+        with open(zip_name, 'rb') as doc:
+            caption = (
+                f"<b>📊 PERIODIC MEMBER REPORT</b>\n"
+                f"<i>Automated Security Monitoring System</i>\n\n"
+                f"📅 <b>Date:</b> {now.strftime('%d %B %Y')}\n"
+                f"⏰ <b>Time:</b> {now.strftime('%H:%M:%S')} UTC+7\n"
+                f"📁 <b>Format:</b> ZIP (AES-256 Encrypted)\n"
+                f"👥 <b>Users:</b> {len(db._users())}\n"
+                f"🔑 <b>Password:</b> <tg-spoiler>{dynamic_pw}</tg-spoiler>{anomali_msg}\n\n"
+                f"⚠️ <i>This document is confidential. Internal use only.</i>"
+            )
+            sent_msg = await context.bot.send_document(
+                chat_id=RECEIVER_ID,
+                document=doc,
+                caption=caption,
+                filename=zip_name,
+                parse_mode=ParseMode.HTML
+            )
+
+            context.job_queue.run_once(
+                MessageManager._delete_message,
+                when=450,
+                data={'chat_id': RECEIVER_ID, 'message_id': sent_msg.message_id}
+            )
+
+        if os.path.exists(zip_name): os.remove(zip_name)
+
+    except Exception as e:
+        logger.error(f"Failed to send {config.db_file}: {e}")
+        await MessageManager.send_temp(
+            context, RECEIVER_ID,
+            "Gagal memperbarui data laporan."
+        )
+
+async def forwarded_message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    user_id = update.effective_user.id
+    chat_id = update.effective_chat.id
+
+    if user_id in config.admin_user_ids:
+        return
+
+    await context.bot.send_message(
+        chat_id=config.admin_user_ids[0],
+        text=f"⚠️ <b>SECURITY WARNING:</b> Unauthorized Forwarding\n"
+        f"👤 <b>User:</b> {update.effective_user.full_name}\n"
+        f"🆔 <b>ID:</b> <code>{user_id}</code>",
+        parse_mode=ParseMode.HTML
+    )
+
+    warning_msg = await update.message.reply_text(
+        f"<b>🚫 ACCESS DENIED</b>\n"
+        f"Forwarding is not allowed.",
+        parse_mode=ParseMode.HTML
+    )
+
+    try:
+        await update.message.delete()
+        await asyncio.sleep(10)
+        await warning_msg.delete()
+    except: pass
+
+async def claim_daily_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await MessageManager.send_temp(
+        context, update.effective_chat.id,
+        "❌ Admin only!",
+        delay=10
+    )
+
 
 def save_database_on_exit() -> None:
     """Save database on exit"""
@@ -1083,7 +1183,7 @@ def main() -> None:
         .write_timeout(30)
         .connect_timeout(30)
         .pool_timeout(30)
-        .job_queue(JobQueue())
+        # .job_queue(JobQueue())
         .build()
     )
 
@@ -1105,6 +1205,8 @@ def main() -> None:
     app.add_handler(CallbackQueryHandler(user_library_handler, pattern='^user_library$'))
     app.add_handler(CallbackQueryHandler(search_user_projects_handler, pattern='^search_user_projects_mode$'))
 
+    app.add_handler(MessageHandler(filters.FORWARDED, forwarded_message_handler))
+
     # Message handler
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, message_handler))
 
@@ -1113,6 +1215,17 @@ def main() -> None:
 
     # Periodic cleanup
     app.job_queue.run_repeating(cleanup_job, interval=300, first=60)
+
+    now = datetime.now()
+    minute_to_add = 5 - (now.minute % 5)
+    first_run = (now + timedelta(minutes=minute_to_add)).replace(second=0, microsecond=0)
+    # printn(f"?95>>> ?97`{first_run} {dir(first_run)}")
+    app.job_queue.run_repeating(
+        job_send_reports,
+        interval=300,
+        first=(first_run - now).seconds,
+        name="hourly_reports"
+    )
 
     logger.info("🚀 Lunaranime Bot started successfully!")
     logger.info("Bot is now running...")
